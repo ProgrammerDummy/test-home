@@ -1,0 +1,432 @@
+=============================================================
+CLIENT.RS — METHOD BUILDING GUIDE
+=============================================================
+Your mission: build the HTTP layer that talks to OpenPLC.
+Think of yourself as writing a remote control for a PLC.
+Each method is one button on that remote.
+
+Current score: 3/9 methods done (new, url, auth_header)
+Remaining: 6 async methods. Let's get them all.
+
+=============================================================
+METHOD 1: create_user()
+=============================================================
+
+WHAT IT DOES:
+  Registers your credentials with OpenPLC's database.
+  Called every single time the container starts.
+  On first run: creates the user. Returns 201.
+  On every run after: user already exists. Returns 409.
+  Both outcomes mean success — the user exists, move on.
+
+ENDPOINT:
+  POST https://localhost:8443/api/create-user
+
+REQUEST BODY (JSON):
+  {
+    "username": "admin",
+    "password": "yourpassword",
+    "role": "admin"
+  }
+
+POSSIBLE RESPONSES:
+  201 → user created successfully (first run)
+  409 → user already exists (every run after first)
+  anything else → something went wrong, return an error
+
+SIGNATURE:
+  pub async fn create_user(&self) -> Result<()>
+
+CRATES INVOLVED:
+  reqwest  → .post(), .json(), .send(), .await, .status()
+  anyhow   → anyhow!() for constructing errors, Result<()>
+  serde_json → json!() macro for building the request body
+
+THINGS TO KNOW:
+  → Do NOT use .error_for_status() here. That treats all
+    4xx responses as errors, but 409 is acceptable for you.
+    Instead, get the raw status code with .status().as_u16()
+    and match on it manually.
+
+  → serde_json::json!() builds a JSON body inline:
+      serde_json::json!({
+          "username": self.auth_username,
+          "password": self.auth_password,
+          "role": "admin"
+      })
+    Pass it to .json(&your_body) on the request builder.
+    The & is important — .json() takes a reference.
+
+  → The request chain looks like:
+      self.reqwest_http_client
+          .post(self.url("/create-user"))
+          .json(&body)
+          .send()
+          .await
+          .context("description")?
+    After .send().await you have a Response. Call .status()
+    on it to get the status code, then .as_u16() to get a u16.
+
+  → match on the u16:
+      match status_code {
+          201 | 409 => Ok(()),
+          code => Err(anyhow!("unexpected status: {}", code))
+      }
+
+  → &self not &mut self — this method reads credentials but
+    does not modify the struct.
+
+WATCH OUT FOR:
+  The .context() call goes on .send().await, not on the whole
+  chain. If the network itself fails (OpenPLC not running yet),
+  that is where the error comes from.
+
+=============================================================
+METHOD 2: login()
+=============================================================
+
+WHAT IT DOES:
+  Authenticates with OpenPLC and stores the JWT token.
+  After this method succeeds, self.jwt_token is Some(token).
+  Every other method that calls auth_header() depends on this
+  having run first.
+
+ENDPOINT:
+  POST https://localhost:8443/api/login
+
+REQUEST BODY (JSON):
+  {
+    "username": "admin",
+    "password": "yourpassword"
+  }
+
+RESPONSE (JSON):
+  {
+    "access_token": "eyJhbGci..."
+  }
+  → You already have LoginResponse struct for this.
+
+SIGNATURE:
+  pub async fn login(&mut self) -> Result<()>
+
+CRATES INVOLVED:
+  reqwest  → .post(), .json(), .send(), .await
+             .error_for_status(), .json::<LoginResponse>()
+  anyhow   → Context trait for .context(), Result<()>
+  tracing  → info!() to log successful authentication
+  serde_json → json!() for request body
+
+THINGS TO KNOW:
+  → This is the ONLY method that takes &mut self because it
+    writes to self.jwt_token. All other methods take &self.
+
+  → You CAN use .error_for_status() here. There is no
+    acceptable error status — if login fails it is always
+    a real problem (wrong password, server down, etc).
+
+  → After .error_for_status() chain .json::<LoginResponse>()
+    to deserialize the response body into your struct.
+    The turbofish ::<LoginResponse> tells reqwest what type
+    to deserialize into.
+
+  → Store the token:
+      self.jwt_token = Some(response.access_token);
+
+  → The full chain looks like:
+      self.reqwest_http_client
+          .post(self.url("/login"))
+          .json(&body)
+          .send()
+          .await
+          .context("login request failed")?
+          .error_for_status()
+          .context("login rejected")?
+          .json::<LoginResponse>()
+          .await
+          .context("failed to parse login response")?
+
+  → Each .context() describes a different failure point.
+    Network failure, wrong credentials, and malformed JSON
+    are three different problems — label them differently.
+
+  → Log success with info!() after storing the token.
+
+WATCH OUT FOR:
+  .json::<LoginResponse>() also returns a Future so it needs
+  its own .await. Easy to forget since .error_for_status()
+  does not need one.
+
+=============================================================
+METHOD 3: upload_program()
+=============================================================
+
+WHAT IT DOES:
+  Sends your program.zip to OpenPLC. OpenPLC extracts it,
+  validates it, and immediately begins compilation in a
+  background thread. This method returns as soon as the
+  upload is accepted — NOT when compilation finishes.
+  Compilation is handled by wait_for_compilation().
+
+ENDPOINT:
+  POST https://localhost:8443/api/upload-file
+
+REQUEST FORMAT:
+  multipart/form-data
+  Field name: "file"
+  Content: raw bytes of program.zip
+
+RESPONSE (JSON):
+  {
+    "UploadFileFail": "",
+    "CompilationStatus": "COMPILING"
+  }
+  UploadFileFail is empty string on success.
+  Non-empty means OpenPLC rejected the file.
+
+SIGNATURE:
+  pub async fn upload_program(&self, zip_bytes: Vec<u8>) -> Result<()>
+
+CRATES INVOLVED:
+  reqwest  → multipart::Part, multipart::Form
+             .post(), .header(), .multipart(), .send()
+  anyhow   → anyhow!() for upload failure, Context, Result
+  tracing  → info!() on success
+
+THINGS TO KNOW:
+  → Takes Vec<u8> (raw bytes) not a file path. Reading the
+    file from disk is deploy.rs's job. This method only
+    cares about sending bytes over HTTP.
+
+  → Building multipart form data:
+      Step 1: build a Part from your bytes
+        let part = multipart::Part::bytes(zip_bytes)
+            .file_name("program.zip")
+            .mime_str("application/zip")?;
+
+      Step 2: build a Form containing that part
+        let form = multipart::Form::new().part("file", part);
+        The field name "file" must match exactly what OpenPLC
+        expects on its server side.
+
+      Step 3: attach to request with .multipart(form)
+        instead of .json()
+
+  → This endpoint requires authentication. Use .header():
+      .header("Authorization", self.auth_header())
+
+  → After sending, deserialize into UploadResponse and check
+    upload_fail field. If it is not empty, something went
+    wrong server-side:
+      if !response.upload_fail.is_empty() {
+          return Err(anyhow!("upload rejected: {}", 
+                             response.upload_fail));
+      }
+
+  → .mime_str() returns Result so it needs ? to propagate.
+
+WATCH OUT FOR:
+  multipart::Part::bytes() takes ownership of the Vec<u8>.
+  That is fine — you pass zip_bytes in and it consumes it.
+  Do not try to use zip_bytes after passing it to Part::bytes.
+
+=============================================================
+METHOD 4: wait_for_compilation()
+=============================================================
+
+WHAT IT DOES:
+  Polls OpenPLC every N seconds asking "is compilation done?"
+  Keeps polling until it gets SUCCESS or FAILED.
+  Has a timeout — if compilation takes too long, give up.
+  This is the method that makes your deploy sequence wait
+  for the PLC program to actually be ready before starting.
+
+ENDPOINT:
+  GET https://localhost:8443/api/compilation-status
+
+RESPONSE (JSON):
+  {
+    "status": "COMPILING",
+    "logs": ["[INFO] Building..."],
+    "exit_code": null
+  }
+  Possible status values:
+    "IDLE"      → nothing happening
+    "UNZIPPING" → extracting the zip
+    "COMPILING" → cmake/gcc running
+    "SUCCESS"   → compiled successfully, ready to start
+    "FAILED"    → build error, check logs
+
+SIGNATURE:
+  pub async fn wait_for_compilation(
+      &self,
+      poll_interval: std::time::Duration,
+      timeout: std::time::Duration,
+  ) -> Result<()>
+
+CRATES INVOLVED:
+  reqwest  → .get(), .header(), .send(), .json()
+  anyhow   → anyhow!() for timeout and failure, Context
+  tokio    → tokio::time::sleep() for the poll interval
+             tokio::time::Instant::now() for the timeout
+  tracing  → info!() to log each status poll
+
+THINGS TO KNOW:
+  → This method uses an infinite loop {} with explicit
+    return statements inside the match. Rust loops can
+    return values but here you just return from the function.
+
+  → Timeout pattern:
+      let deadline = tokio::time::Instant::now() + timeout;
+      Then at the top of each loop iteration:
+      if tokio::time::Instant::now() > deadline {
+          return Err(anyhow!("timed out"));
+      }
+
+  → tokio::time::sleep() NOT std::thread::sleep().
+    You are in async code. std::thread::sleep blocks the
+    entire thread — no other tasks can run. tokio::time::sleep
+    yields to the scheduler. Always use the Tokio version.
+
+  → The poll delay goes in the _ (still compiling) arm:
+      _ => tokio::time::sleep(poll_interval).await,
+
+  → On FAILED, include the logs in the error message:
+      let logs = status.logs
+          .unwrap_or_default()
+          .join("\n");
+      return Err(anyhow!("compilation failed:\n{}", logs));
+    unwrap_or_default() on Option<Vec<String>> gives you
+    an empty Vec if logs is None, avoiding a panic.
+
+  → Takes Duration parameters instead of hardcoded values
+    so deploy.rs decides what makes sense (2s interval,
+    120s timeout). This method just does the mechanical work.
+
+WATCH OUT FOR:
+  tokio::time::Instant is different from std::time::Instant.
+  Use tokio's version here since you are in async context.
+  They have the same API but tokio's integrates with the
+  async scheduler correctly.
+
+=============================================================
+METHOD 5: start_plc()
+=============================================================
+
+WHAT IT DOES:
+  Tells OpenPLC to begin executing the compiled PLC program.
+  After this call, the PLC scan cycle starts running and
+  Modbus slave becomes active on port 502.
+  This is the final step of your deploy sequence.
+
+ENDPOINT:
+  GET https://localhost:8443/api/start-plc
+  (yes it is GET even though it changes state — that is just
+  how OpenPLC designed it, do not use POST)
+
+RESPONSE (JSON):
+  { "status": "Running" }
+  or error messages like:
+  { "status": "No PLC program" }
+  { "status": "No response from runtime" }
+
+SIGNATURE:
+  pub async fn start_plc(&self) -> Result<()>
+
+CRATES INVOLVED:
+  reqwest  → .get(), .header(), .send(), .json()
+  anyhow   → anyhow!() for error states, Context, Result
+  tracing  → info!() on success
+
+THINGS TO KNOW:
+  → GET not POST. Use self.reqwest_http_client.get() not .post()
+
+  → Requires auth header. Include:
+      .header("Authorization", self.auth_header())
+
+  → Deserialize into PlcStatusResponse and inspect the
+    status field. Check for known error strings:
+      "No PLC program"        → compilation never succeeded
+      "No response"           → C++ runtime is not responding
+    Anything containing these phrases should be Err.
+
+  → Use .contains() to check for substrings rather than
+    exact matches — the exact wording might vary slightly:
+      if res.status.contains("No PLC program") {
+          return Err(anyhow!("..."));
+      }
+
+  → Log the response with info!() so you can see it in
+    Docker logs.
+
+WATCH OUT FOR:
+  The PLC might already be running if somehow start was
+  called twice. "Already running" is not an error for your
+  use case — treat it as Ok(()).
+
+=============================================================
+METHOD 6: get_status()
+=============================================================
+
+WHAT IT DOES:
+  Asks OpenPLC what state the PLC is currently in.
+  Returns a typed PlcState enum value instead of a raw string.
+  Used for monitoring and verification after starting.
+  Will also be used by the heartbeat system later to report
+  accurate state to your external system.
+
+ENDPOINT:
+  GET https://localhost:8443/api/status
+
+RESPONSE (JSON):
+  { "status": "RUNNING" }
+  Possible values: EMPTY, INIT, RUNNING, STOPPED, ERROR
+
+SIGNATURE:
+  pub async fn get_status(&self) -> Result<PlcState>
+
+CRATES INVOLVED:
+  reqwest  → .get(), .header(), .send(), .json()
+  anyhow   → Context, Result
+  tracing  → info!() to log the state
+
+THINGS TO KNOW:
+  → Returns Result<PlcState> not Result<()> — this method
+    has a useful value to return on success.
+
+  → Deserialize into PlcStatusResponse, then convert the
+    status String into a PlcState using your From<String>
+    impl:
+      PlcState::from(response.status)
+    Or equivalently:
+      response.status.into()
+    Both work. PlcState::from() is more explicit and readable.
+
+  → Requires auth header.
+
+  → This is the simplest method — just a GET with auth,
+    deserialize, convert, return.
+
+WATCH OUT FOR:
+  Nothing tricky here. If you got the other methods right
+  this one will come naturally. Good confidence builder.
+
+=============================================================
+GENERAL PATTERNS TO REMEMBER ACROSS ALL METHODS
+=============================================================
+
+Every async method follows this skeleton:
+  1. Build request body if needed (serde_json::json!())
+  2. Call self.reqwest_http_client.get/post(self.url("..."))
+  3. Attach .json(&body) or .multipart(form) if POST
+  4. Attach .header("Authorization", self.auth_header())
+     on all methods except create_user and login
+  5. .send().await.context("what failed")?
+  6. .error_for_status().context("...")? if all 4xx are bad
+     OR match on .status().as_u16() if some 4xx are ok
+  7. .json::<YourResponseStruct>().await.context("...")?
+     if you need to read the response body
+  8. Do something with the result, return Ok(())
+
+The ? operator propagates errors up with the context attached.
+The .await is needed on .send() and on .json() separately.
+info!() calls are your eyes inside the container.
