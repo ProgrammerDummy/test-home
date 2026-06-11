@@ -1,432 +1,391 @@
 =============================================================
-CLIENT.RS — METHOD BUILDING GUIDE
-=============================================================
-Your mission: build the HTTP layer that talks to OpenPLC.
-Think of yourself as writing a remote control for a PLC.
-Each method is one button on that remote.
-
-Current score: 3/9 methods done (new, url, auth_header)
-Remaining: 6 async methods. Let's get them all.
-
-=============================================================
-METHOD 1: create_user()
+DEPLOY.RS AND MAIN.RS — BUILDING GUIDE
 =============================================================
 
-WHAT IT DOES:
-  Registers your credentials with OpenPLC's database.
-  Called every single time the container starts.
-  On first run: creates the user. Returns 201.
-  On every run after: user already exists. Returns 409.
-  Both outcomes mean success — the user exists, move on.
+=============================================================
+FILE 1: deploy.rs
+=============================================================
 
-ENDPOINT:
-  POST https://localhost:8443/api/create-user
+WHAT THIS FILE IS:
+  The sequence coordinator. One function that calls PlcClient
+  methods in the correct order. It knows nothing about HTTP,
+  nothing about JSON. It just orchestrates the steps and
+  handles failures at each point.
 
-REQUEST BODY (JSON):
-  {
-    "username": "admin",
-    "password": "yourpassword",
-    "role": "admin"
-  }
+  Think of it like a recipe. client.rs has the individual
+  cooking techniques. deploy.rs is the recipe that says
+  "do step 1, then step 2, then step 3."
 
-POSSIBLE RESPONSES:
-  201 → user created successfully (first run)
-  409 → user already exists (every run after first)
-  anything else → something went wrong, return an error
+STRUCTURE:
+  deploy.rs
+  └── pub async fn deploy(client: &mut PlcClient, config: &Config) -> Result<()>
 
-SIGNATURE:
-  pub async fn create_user(&self) -> Result<()>
+  That is the entire file. One public async function.
+  No structs. No enums. No helper functions.
 
-CRATES INVOLVED:
-  reqwest  → .post(), .json(), .send(), .await, .status()
-  anyhow   → anyhow!() for constructing errors, Result<()>
-  serde_json → json!() macro for building the request body
+IMPORTS YOU NEED:
+  use std::time::Duration;
+  use anyhow::{Context, Result};
+  use tracing::info;
+  use crate::client::PlcClient;
+  use crate::config::Config;
+
+  crate:: is how you reference your own modules within the
+  project. crate::client::PlcClient means "PlcClient from
+  the client module in this crate."
+
+  std::time::Duration is for the poll interval and timeout
+  values you pass to wait_for_compilation(). You will call
+  it with Duration::from_secs(2) and Duration::from_secs(120).
+
+THE FUNCTION SIGNATURE:
+  pub async fn deploy(client: &mut PlcClient, config: &Config) -> Result<()>
+
+  Why &mut PlcClient:
+    login() writes to self.jwt_token, so it needs &mut self.
+    Since deploy() calls login(), it needs mutable access
+    to the client. Every other method only needs &self but
+    because login() needs mut, the whole client reference
+    here must be mut.
+
+  Why &Config:
+    You only need to read from config — specifically
+    config.program_zip_path. A shared reference is enough.
+    No need to take ownership.
+
+  Why Result<()>:
+    This function can fail at any step. If it succeeds there
+    is no useful value to return — just confirmation it worked.
+    () is Rust's "nothing" type, used when a function succeeds
+    but has no value to give back.
+
+THE SEQUENCE — write these steps in order:
+
+  STEP 1: Log that the deploy sequence is starting
+    info!() with a message so you can see it in Docker logs.
+
+  STEP 2: create_user()
+    Call client.create_user().await
+    Attach .context("user setup failed") so if it fails
+    you know which step went wrong.
+    Use ? to propagate the error up.
+
+  STEP 3: login()
+    Call client.login().await
+    Attach .context("authentication failed")
+    Use ?
+
+  STEP 4: Read the zip file from disk
+    Use tokio::fs::read(&config.program_zip_path).await
+    NOT std::fs::read() — you are in async code.
+    tokio::fs::read yields to the scheduler while waiting
+    for disk I/O. std::fs::read blocks the thread.
+    Returns Result<Vec<u8>> — the raw bytes of the file.
+    Use .with_context(|| format!("failed to read zip at '{}'",
+        config.program_zip_path))
+    with_context takes a closure instead of a value —
+    use it when building the context string requires
+    allocation (like format!()) so it only runs on error.
+
+  STEP 5: Log the zip size
+    info!() showing how many bytes were read.
+    zip_bytes.len() gives you the byte count.
+
+  STEP 6: upload_program()
+    Call client.upload_program(zip_bytes).await
+    Attach .context("program upload failed")
+    Use ?
+
+  STEP 7: wait_for_compilation()
+    Call client.wait_for_compilation(
+        Duration::from_secs(2),    // poll every 2 seconds
+        Duration::from_secs(120),  // give up after 2 minutes
+    ).await
+    Attach .context("compilation failed")
+    Use ?
+
+  STEP 8: start_plc()
+    Call client.start_plc().await
+    Attach .context("failed to start PLC")
+    Use ?
+
+  STEP 9: Log success
+    info!() celebrating that the deploy is complete.
+
+  STEP 10: return Ok(())
 
 THINGS TO KNOW:
-  → Do NOT use .error_for_status() here. That treats all
-    4xx responses as errors, but 409 is acceptable for you.
-    Instead, get the raw status code with .status().as_u16()
-    and match on it manually.
 
-  → serde_json::json!() builds a JSON body inline:
-      serde_json::json!({
-          "username": self.auth_username,
-          "password": self.auth_password,
-          "role": "admin"
-      })
-    Pass it to .json(&your_body) on the request builder.
-    The & is important — .json() takes a reference.
+  → .context() vs .with_context()
+    .context("fixed string") — use when the message is a
+    plain string literal. Cheap, always fine.
+    .with_context(|| format!(...)) — use when building the
+    message requires work (string formatting, allocations).
+    The closure only runs if there IS an error, so you do
+    not pay the cost of format!() on the happy path.
 
-  → The request chain looks like:
-      self.reqwest_http_client
-          .post(self.url("/create-user"))
-          .json(&body)
-          .send()
-          .await
-          .context("description")?
-    After .send().await you have a Response. Call .status()
-    on it to get the status code, then .as_u16() to get a u16.
+  → Why tokio::fs::read and not std::fs::read
+    std::fs::read blocks the OS thread while the disk is
+    reading. In async Rust that means no other task can
+    run on that thread until the read completes.
+    tokio::fs::read is the async version — it hands the
+    read off to a thread pool internally and yields your
+    async task until the data is ready. Always use the
+    Tokio version in async code.
 
-  → match on the u16:
-      match status_code {
-          201 | 409 => Ok(()),
-          code => Err(anyhow!("unexpected status: {}", code))
+  → Why the poll interval is 2 seconds and timeout 120 seconds
+    The poll interval controls how often you ask OpenPLC
+    "are you done yet?" Too fast wastes CPU and network.
+    Too slow means you wait longer than necessary to notice
+    completion. 2 seconds is a reasonable middle ground.
+    The timeout is a safety net — if something goes wrong
+    during compilation and it never finishes, you do not
+    want your container to hang forever. 120 seconds is
+    generous for even slow hardware.
+
+  → Each .context() should describe WHAT YOU WERE TRYING TO DO
+    not WHAT WENT WRONG. The underlying error already says
+    what went wrong. The context says where in your sequence
+    it happened. Together they form a readable error chain:
+      "compilation failed: timed out after 120 seconds"
+    That is much more useful than just:
+      "timed out after 120 seconds"
+
+WATCH OUT FOR:
+  tokio::fs::read is not imported by default. You need to
+  either write tokio::fs::read(...) with the full path,
+  or add use tokio::fs; at the top and write fs::read(...).
+  Both work — pick whichever feels cleaner to you.
+
+=============================================================
+FILE 2: main.rs
+=============================================================
+
+WHAT THIS FILE IS:
+  The entry point and wiring layer. It:
+    1. Initializes logging
+    2. Reads config
+    3. Waits for OpenPLC to start
+    4. Builds the PlcClient
+    5. Calls deploy()
+    6. Exits cleanly on success or failure
+
+  It should be thin. No business logic lives here.
+  If you find yourself writing HTTP calls or sequence
+  logic in main.rs, move it to a different file.
+
+STRUCTURE:
+  main.rs
+  ├── mod config;      ← declares config module
+  ├── mod client;      ← declares client module
+  ├── mod deploy;      ← declares deploy module
+  └── async fn main()  ← the entry point
+
+IMPORTS YOU NEED:
+  use anyhow::Result;
+  use tracing::{error, info};
+  use tracing_subscriber::EnvFilter;
+
+  The mod declarations are not use statements — they tell
+  Rust that these files exist as modules in your project.
+  The use statements bring specific items into scope.
+
+THE #[tokio::main] MACRO:
+  Your main function must be:
+    #[tokio::main]
+    async fn main() -> Result<()> {
+
+  #[tokio::main] is a procedural macro that wraps your
+  async main in a synchronous entry point. It:
+    - Creates a Tokio runtime
+    - Starts the runtime's thread pool
+    - Runs your async main() on it
+    - Blocks until main() completes
+    - Shuts down the runtime
+
+  Without it, async fn main() would not compile — Rust
+  does not know how to run an async entry point without
+  a runtime to drive it.
+
+  The -> Result<()> return type means if main() returns
+  Err, Rust automatically prints the error and exits with
+  a non-zero exit code. Docker treats non-zero exit codes
+  as container failure — exactly what you want.
+
+STEP 1: Initialize logging
+  tracing_subscriber::fmt()
+      .with_env_filter(
+          EnvFilter::from_default_env()
+              .add_directive("plc_node=info".parse()?)
+      )
+      .init();
+
+  This sets up the logging system. Two things happening:
+    from_default_env() reads the RUST_LOG environment
+    variable to set the log level. If RUST_LOG=debug you
+    see everything. If RUST_LOG=info you see info and above.
+    add_directive("plc_node=info") sets the default for
+    your own code to info level even if RUST_LOG is not set.
+    "plc_node" is your crate name from Cargo.toml.
+  
+  .init() installs this as the global subscriber — from
+  this point on, all info!() warn!() error!() calls in
+  your code are captured and printed to stdout.
+
+  This must be the FIRST thing in main() — before any
+  other code runs, so nothing is missed.
+
+STEP 2: Read config
+  let config = config::Config::from_env();
+
+  This either succeeds and gives you a Config, or panics
+  immediately with a clear message. You already know this
+  from writing config.rs.
+
+STEP 3: Log startup
+  info!("PLC node starting, node_id={}", config.node_id);
+
+  This is the first log line you will see in Docker logs.
+  Good to include the node_id so you know which container
+  you are looking at when you have multiple running.
+
+STEP 4: Wait for OpenPLC to initialize
+  info!("Waiting {}s for OpenPLC to start...", 
+        config.plc_startup_delay_secs);
+  tokio::time::sleep(
+      std::time::Duration::from_secs(config.plc_startup_delay_secs)
+  ).await;
+
+  OpenPLC needs time to start its Flask server, generate
+  TLS certificates on first run, and start the C++ runtime.
+  If you try to connect immediately, the connection will
+  be refused. This delay gives it time to be ready.
+
+  In Stage 1 testing (Rust running outside Docker against
+  an already-running OpenPLC container), you set
+  PLC_STARTUP_DELAY_SECS=0 to skip this wait.
+
+STEP 5: Build the PlcClient
+  let mut client = client::PlcClient::new(
+      &config.plc_url,
+      &config.plc_username,
+      &config.plc_password,
+  )?;
+
+  The ? propagates if ClientBuilder::build() fails.
+  Must be mut because deploy() calls login() which
+  needs &mut self.
+
+STEP 6: Run the deploy sequence
+  match deploy::deploy(&mut client, &config).await {
+      Ok(()) => {
+          info!("Deploy successful — PLC is running");
       }
-
-  → &self not &mut self — this method reads credentials but
-    does not modify the struct.
-
-WATCH OUT FOR:
-  The .context() call goes on .send().await, not on the whole
-  chain. If the network itself fails (OpenPLC not running yet),
-  that is where the error comes from.
-
-=============================================================
-METHOD 2: login()
-=============================================================
-
-WHAT IT DOES:
-  Authenticates with OpenPLC and stores the JWT token.
-  After this method succeeds, self.jwt_token is Some(token).
-  Every other method that calls auth_header() depends on this
-  having run first.
-
-ENDPOINT:
-  POST https://localhost:8443/api/login
-
-REQUEST BODY (JSON):
-  {
-    "username": "admin",
-    "password": "yourpassword"
-  }
-
-RESPONSE (JSON):
-  {
-    "access_token": "eyJhbGci..."
-  }
-  → You already have LoginResponse struct for this.
-
-SIGNATURE:
-  pub async fn login(&mut self) -> Result<()>
-
-CRATES INVOLVED:
-  reqwest  → .post(), .json(), .send(), .await
-             .error_for_status(), .json::<LoginResponse>()
-  anyhow   → Context trait for .context(), Result<()>
-  tracing  → info!() to log successful authentication
-  serde_json → json!() for request body
-
-THINGS TO KNOW:
-  → This is the ONLY method that takes &mut self because it
-    writes to self.jwt_token. All other methods take &self.
-
-  → You CAN use .error_for_status() here. There is no
-    acceptable error status — if login fails it is always
-    a real problem (wrong password, server down, etc).
-
-  → After .error_for_status() chain .json::<LoginResponse>()
-    to deserialize the response body into your struct.
-    The turbofish ::<LoginResponse> tells reqwest what type
-    to deserialize into.
-
-  → Store the token:
-      self.jwt_token = Some(response.access_token);
-
-  → The full chain looks like:
-      self.reqwest_http_client
-          .post(self.url("/login"))
-          .json(&body)
-          .send()
-          .await
-          .context("login request failed")?
-          .error_for_status()
-          .context("login rejected")?
-          .json::<LoginResponse>()
-          .await
-          .context("failed to parse login response")?
-
-  → Each .context() describes a different failure point.
-    Network failure, wrong credentials, and malformed JSON
-    are three different problems — label them differently.
-
-  → Log success with info!() after storing the token.
-
-WATCH OUT FOR:
-  .json::<LoginResponse>() also returns a Future so it needs
-  its own .await. Easy to forget since .error_for_status()
-  does not need one.
-
-=============================================================
-METHOD 3: upload_program()
-=============================================================
-
-WHAT IT DOES:
-  Sends your program.zip to OpenPLC. OpenPLC extracts it,
-  validates it, and immediately begins compilation in a
-  background thread. This method returns as soon as the
-  upload is accepted — NOT when compilation finishes.
-  Compilation is handled by wait_for_compilation().
-
-ENDPOINT:
-  POST https://localhost:8443/api/upload-file
-
-REQUEST FORMAT:
-  multipart/form-data
-  Field name: "file"
-  Content: raw bytes of program.zip
-
-RESPONSE (JSON):
-  {
-    "UploadFileFail": "",
-    "CompilationStatus": "COMPILING"
-  }
-  UploadFileFail is empty string on success.
-  Non-empty means OpenPLC rejected the file.
-
-SIGNATURE:
-  pub async fn upload_program(&self, zip_bytes: Vec<u8>) -> Result<()>
-
-CRATES INVOLVED:
-  reqwest  → multipart::Part, multipart::Form
-             .post(), .header(), .multipart(), .send()
-  anyhow   → anyhow!() for upload failure, Context, Result
-  tracing  → info!() on success
-
-THINGS TO KNOW:
-  → Takes Vec<u8> (raw bytes) not a file path. Reading the
-    file from disk is deploy.rs's job. This method only
-    cares about sending bytes over HTTP.
-
-  → Building multipart form data:
-      Step 1: build a Part from your bytes
-        let part = multipart::Part::bytes(zip_bytes)
-            .file_name("program.zip")
-            .mime_str("application/zip")?;
-
-      Step 2: build a Form containing that part
-        let form = multipart::Form::new().part("file", part);
-        The field name "file" must match exactly what OpenPLC
-        expects on its server side.
-
-      Step 3: attach to request with .multipart(form)
-        instead of .json()
-
-  → This endpoint requires authentication. Use .header():
-      .header("Authorization", self.auth_header())
-
-  → After sending, deserialize into UploadResponse and check
-    upload_fail field. If it is not empty, something went
-    wrong server-side:
-      if !response.upload_fail.is_empty() {
-          return Err(anyhow!("upload rejected: {}", 
-                             response.upload_fail));
+      Err(e) => {
+          error!("Deploy failed: {:#}", e);
+          std::process::exit(1);
       }
-
-  → .mime_str() returns Result so it needs ? to propagate.
-
-WATCH OUT FOR:
-  multipart::Part::bytes() takes ownership of the Vec<u8>.
-  That is fine — you pass zip_bytes in and it consumes it.
-  Do not try to use zip_bytes after passing it to Part::bytes.
-
-=============================================================
-METHOD 4: wait_for_compilation()
-=============================================================
-
-WHAT IT DOES:
-  Polls OpenPLC every N seconds asking "is compilation done?"
-  Keeps polling until it gets SUCCESS or FAILED.
-  Has a timeout — if compilation takes too long, give up.
-  This is the method that makes your deploy sequence wait
-  for the PLC program to actually be ready before starting.
-
-ENDPOINT:
-  GET https://localhost:8443/api/compilation-status
-
-RESPONSE (JSON):
-  {
-    "status": "COMPILING",
-    "logs": ["[INFO] Building..."],
-    "exit_code": null
   }
-  Possible status values:
-    "IDLE"      → nothing happening
-    "UNZIPPING" → extracting the zip
-    "COMPILING" → cmake/gcc running
-    "SUCCESS"   → compiled successfully, ready to start
-    "FAILED"    → build error, check logs
 
-SIGNATURE:
-  pub async fn wait_for_compilation(
-      &self,
-      poll_interval: std::time::Duration,
-      timeout: std::time::Duration,
-  ) -> Result<()>
+  {:#} prints the full error chain with all the context
+  messages attached. This is what you want in logs —
+  "deploy failed: compilation failed: timed out after 120s"
+  tells you exactly what happened and where.
 
-CRATES INVOLVED:
-  reqwest  → .get(), .header(), .send(), .json()
-  anyhow   → anyhow!() for timeout and failure, Context
-  tokio    → tokio::time::sleep() for the poll interval
-             tokio::time::Instant::now() for the timeout
-  tracing  → info!() to log each status poll
+  std::process::exit(1) exits with a non-zero code.
+  Docker sees this and marks the container as failed.
+  This is intentional — if the deploy fails, the container
+  should not keep running. You want Docker to know something
+  went wrong so it can restart or alert.
 
-THINGS TO KNOW:
-  → This method uses an infinite loop {} with explicit
-    return statements inside the match. Rust loops can
-    return values but here you just return from the function.
+  Why not just return Err(e) from main?
+  You could, and it would work. But the error formatting
+  from -> Result<()> return in main is less controlled —
+  you get a Debug print rather than the clean {:#} chain.
+  Explicitly matching and logging gives you cleaner output.
 
-  → Timeout pattern:
-      let deadline = tokio::time::Instant::now() + timeout;
-      Then at the top of each loop iteration:
-      if tokio::time::Instant::now() > deadline {
-          return Err(anyhow!("timed out"));
-      }
-
-  → tokio::time::sleep() NOT std::thread::sleep().
-    You are in async code. std::thread::sleep blocks the
-    entire thread — no other tasks can run. tokio::time::sleep
-    yields to the scheduler. Always use the Tokio version.
-
-  → The poll delay goes in the _ (still compiling) arm:
-      _ => tokio::time::sleep(poll_interval).await,
-
-  → On FAILED, include the logs in the error message:
-      let logs = status.logs
-          .unwrap_or_default()
-          .join("\n");
-      return Err(anyhow!("compilation failed:\n{}", logs));
-    unwrap_or_default() on Option<Vec<String>> gives you
-    an empty Vec if logs is None, avoiding a panic.
-
-  → Takes Duration parameters instead of hardcoded values
-    so deploy.rs decides what makes sense (2s interval,
-    120s timeout). This method just does the mechanical work.
-
-WATCH OUT FOR:
-  tokio::time::Instant is different from std::time::Instant.
-  Use tokio's version here since you are in async context.
-  They have the same API but tokio's integrates with the
-  async scheduler correctly.
-
-=============================================================
-METHOD 5: start_plc()
-=============================================================
-
-WHAT IT DOES:
-  Tells OpenPLC to begin executing the compiled PLC program.
-  After this call, the PLC scan cycle starts running and
-  Modbus slave becomes active on port 502.
-  This is the final step of your deploy sequence.
-
-ENDPOINT:
-  GET https://localhost:8443/api/start-plc
-  (yes it is GET even though it changes state — that is just
-  how OpenPLC designed it, do not use POST)
-
-RESPONSE (JSON):
-  { "status": "Running" }
-  or error messages like:
-  { "status": "No PLC program" }
-  { "status": "No response from runtime" }
-
-SIGNATURE:
-  pub async fn start_plc(&self) -> Result<()>
-
-CRATES INVOLVED:
-  reqwest  → .get(), .header(), .send(), .json()
-  anyhow   → anyhow!() for error states, Context, Result
-  tracing  → info!() on success
+STEP 7: Return Ok(())
+  After the match, if deploy succeeded:
+  Ok(())
 
 THINGS TO KNOW:
-  → GET not POST. Use self.reqwest_http_client.get() not .post()
 
-  → Requires auth header. Include:
-      .header("Authorization", self.auth_header())
+  → Why main() is so thin
+    main.rs is the hardest file to test because it is the
+    entry point — you cannot easily call it from a unit test.
+    Keeping all real logic in other files means the important
+    code is testable. main() just assembles the pieces.
 
-  → Deserialize into PlcStatusResponse and inspect the
-    status field. Check for known error strings:
-      "No PLC program"        → compilation never succeeded
-      "No response"           → C++ runtime is not responding
-    Anything containing these phrases should be Err.
+  → std::process::exit(1) vs returning Err
+    Both signal failure. exit(1) is more explicit and gives
+    you full control over the log output before exiting.
+    Returning Err from main prints the error automatically
+    but the formatting is less clean. For a containerized
+    system where logs are your only visibility, explicit
+    logging before exit is better.
 
-  → Use .contains() to check for substrings rather than
-    exact matches — the exact wording might vary slightly:
-      if res.status.contains("No PLC program") {
-          return Err(anyhow!("..."));
-      }
+  → The order of mod declarations matters for readability
+    Put them at the top before use statements:
+      mod config;
+      mod client;
+      mod deploy;
+    Then use statements below.
+    This makes it immediately clear what modules exist
+    in your project when someone reads main.rs.
 
-  → Log the response with info!() so you can see it in
-    Docker logs.
-
-WATCH OUT FOR:
-  The PLC might already be running if somehow start was
-  called twice. "Already running" is not an error for your
-  use case — treat it as Ok(()).
-
-=============================================================
-METHOD 6: get_status()
-=============================================================
-
-WHAT IT DOES:
-  Asks OpenPLC what state the PLC is currently in.
-  Returns a typed PlcState enum value instead of a raw string.
-  Used for monitoring and verification after starting.
-  Will also be used by the heartbeat system later to report
-  accurate state to your external system.
-
-ENDPOINT:
-  GET https://localhost:8443/api/status
-
-RESPONSE (JSON):
-  { "status": "RUNNING" }
-  Possible values: EMPTY, INIT, RUNNING, STOPPED, ERROR
-
-SIGNATURE:
-  pub async fn get_status(&self) -> Result<PlcState>
-
-CRATES INVOLVED:
-  reqwest  → .get(), .header(), .send(), .json()
-  anyhow   → Context, Result
-  tracing  → info!() to log the state
-
-THINGS TO KNOW:
-  → Returns Result<PlcState> not Result<()> — this method
-    has a useful value to return on success.
-
-  → Deserialize into PlcStatusResponse, then convert the
-    status String into a PlcState using your From<String>
-    impl:
-      PlcState::from(response.status)
-    Or equivalently:
-      response.status.into()
-    Both work. PlcState::from() is more explicit and readable.
-
-  → Requires auth header.
-
-  → This is the simplest method — just a GET with auth,
-    deserialize, convert, return.
+  → Why add_directive uses your crate name
+    "plc_node=info" sets the log level specifically for
+    code in your crate. The crate name comes from the
+    name field in Cargo.toml — if you named it "plc-node"
+    the directive uses "plc_node" (hyphens become underscores).
+    This means even if some dependency is set to debug
+    level via RUST_LOG, your code stays at info unless
+    you explicitly change it.
 
 WATCH OUT FOR:
-  Nothing tricky here. If you got the other methods right
-  this one will come naturally. Good confidence builder.
+  tracing_subscriber is not the same as tracing.
+  tracing is the logging API (the macros you call).
+  tracing_subscriber is what actually formats and prints
+  the logs. You need both. tracing is used everywhere,
+  tracing_subscriber is only set up once in main().
+
+  If you forget .init() on the subscriber, your info!()
+  calls will compile and run but produce no output.
+  Silent logging is a confusing bug to track down.
 
 =============================================================
-GENERAL PATTERNS TO REMEMBER ACROSS ALL METHODS
+TESTING CHECKLIST FOR DEPLOY.RS AND MAIN.RS
 =============================================================
 
-Every async method follows this skeleton:
-  1. Build request body if needed (serde_json::json!())
-  2. Call self.reqwest_http_client.get/post(self.url("..."))
-  3. Attach .json(&body) or .multipart(form) if POST
-  4. Attach .header("Authorization", self.auth_header())
-     on all methods except create_user and login
-  5. .send().await.context("what failed")?
-  6. .error_for_status().context("...")? if all 4xx are bad
-     OR match on .status().as_u16() if some 4xx are ok
-  7. .json::<YourResponseStruct>().await.context("...")?
-     if you need to read the response body
-  8. Do something with the result, return Ok(())
+Before Docker, test against a live OpenPLC instance:
 
-The ? operator propagates errors up with the context attached.
-The .await is needed on .send() and on .json() separately.
-info!() calls are your eyes inside the container.
+  1. Run OpenPLC in Docker:
+     docker run -d --name openplc-test -p 8443:8443 -p 502:502
+     ghcr.io/autonomy-logic/openplc-runtime:latest
+
+  2. Get a program.zip from OpenPLC Editor (blank project is fine)
+
+  3. Run your Rust binary:
+     $env:PLC_PASSWORD="yourpassword"
+     $env:PROGRAM_ZIP="C:\path\to\program.zip"
+     $env:PLC_STARTUP_DELAY_SECS="0"
+     $env:RUST_LOG="info"
+     cargo run
+
+  4. Expected log output:
+     INFO plc_node: PLC node starting, node_id=plc-node-1
+     INFO plc_node: Waiting 0s for OpenPLC to start...
+     INFO plc_node::deploy: Starting deploy sequence
+     INFO plc_node::client: User created successfully (or already exists)
+     INFO plc_node::client: Authenticated with OpenPLC runtime
+     INFO plc_node::deploy: Loaded program zip (XXXX bytes)
+     INFO plc_node::client: Program uploaded, compilation starting
+     INFO plc_node::client: Compilation status: COMPILING
+     INFO plc_node::client: Compilation status: COMPILING
+     INFO plc_node::client: Compilation succeeded
+     INFO plc_node::client: Start PLC response: Running
+     INFO plc_node: Deploy successful — PLC is running
+
+  5. Verify PLC is running — hit the API manually:
+     curl -k https://localhost:8443/api/status
+     (need a JWT token — or just check Docker logs for the Running state)

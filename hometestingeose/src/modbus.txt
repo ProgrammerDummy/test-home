@@ -1,0 +1,394 @@
+=============================================================
+MODBUS, TESTING, AND SIMULATION — COMPLETE REFERENCE
+=============================================================
+
+=============================================================
+SECTION 1: WHAT IS MODBUS TCP
+=============================================================
+
+Modbus is an industrial communication protocol invented in 1979.
+It is still the most widely used protocol in industrial automation.
+Modbus TCP is the version that runs over TCP/IP networks.
+
+The model is simple:
+  One MASTER (your external program or test tool)
+  One or more SLAVES (your OpenPLC containers)
+
+The master sends requests. The slave responds.
+The slave never sends anything unprompted.
+
+OpenPLC runs as a Modbus SLAVE on port 502.
+Your external program will be the Modbus MASTER.
+
+=============================================================
+SECTION 2: MODBUS REGISTER TYPES
+=============================================================
+
+Modbus has four types of memory:
+
+  Coils (Function Code 01/05/15)
+    → 1-bit values, readable and writable
+    → Maps to digital outputs in OpenPLC (%QX addresses)
+    → Example: a relay that is ON or OFF
+
+  Discrete Inputs (Function Code 02)
+    → 1-bit values, read-only
+    → Maps to digital inputs in OpenPLC (%IX addresses)
+    → Example: a pushbutton that is pressed or not
+
+  Holding Registers (Function Code 03/06/16)
+    → 16-bit values, readable and writable
+    → Maps to analog outputs in OpenPLC (%QW addresses)
+    → Example: a motor speed setpoint (0-32767 RPM)
+
+  Input Registers (Function Code 04)
+    → 16-bit values, read-only
+    → Maps to analog inputs in OpenPLC (%IW addresses)
+    → Example: a temperature sensor reading
+
+=============================================================
+SECTION 3: HOW OPENPLC MAPS VARIABLES TO MODBUS REGISTERS
+=============================================================
+
+In the OpenPLC Editor, every variable has a memory address.
+That address determines which Modbus register it maps to.
+
+Digital variables (1-bit):
+  %IX0.0 → Discrete Input, address 0     (read-only input)
+  %IX0.1 → Discrete Input, address 1
+  %QX0.0 → Coil, address 0               (read/write output)
+  %QX0.1 → Coil, address 1
+
+Analog variables (16-bit):
+  %IW0   → Input Register, address 0     (read-only input)
+  %IW1   → Input Register, address 1
+  %QW0   → Holding Register, address 0   (read/write output)
+  %QW1   → Holding Register, address 1
+
+So if you want to read a sensor value from your PLC program
+via Modbus, assign the variable address %IW0 in the Editor
+and then read Input Register 0 from your Modbus master.
+
+If you want to read a computed output value, assign %QW0
+and read Holding Register 0.
+
+=============================================================
+SECTION 4: WHAT YOU NEED TO TEST RIGHT NOW
+=============================================================
+
+For initial testing you do not need a meaningful PLC program.
+A blank project from the Editor is enough to verify:
+  - Your deploy sequence works end to end
+  - OpenPLC compiles and starts the program
+  - Modbus slave is active on port 502
+
+All registers will read as zero on a blank program.
+That is expected and correct.
+
+For a more interesting test, create a simple counter program:
+  1. Open OpenPLC Editor
+  2. Create a new project
+  3. Add a PROGRAM in Structured Text (ST):
+       VAR
+         counter : INT := 0;
+       END_VAR
+       counter := counter + 1;
+  4. Assign counter the address %QW0
+  5. Compile and export as program.zip
+
+Now when the PLC runs, counter increments every scan cycle.
+Reading Holding Register 0 via Modbus will show an
+increasing value — proof the simulation is actually running.
+
+=============================================================
+SECTION 5: TOOLS FOR READING MODBUS VALUES
+=============================================================
+
+--- Option 1: Simply Modbus (Windows GUI, easiest) ---
+
+Download: https://www.simplymodbus.ca/TCPclient.htm
+
+Settings:
+  Mode:       TCP
+  IP Address: localhost (or your Docker host IP)
+  Port:       5020      (your mapped host port)
+  Device ID:  1         (OpenPLC default slave address)
+  First Register: 1
+  No. of Regs:    10
+  Function Code:  03 (Read Holding Registers)
+
+Click SEND to read. You will see the current register values.
+
+--- Option 2: mbpoll (CLI, good for scripting) ---
+
+Install on Windows via WSL:
+  sudo apt install mbpoll
+
+Read holding registers:
+  mbpoll -t 4 -r 1 -c 10 localhost -p 5020
+
+  -t 4   = holding registers (type 4)
+  -r 1   = starting at register 1
+  -c 10  = read 10 registers
+  -p 5020 = port
+
+Read coils:
+  mbpoll -t 0 -r 1 -c 8 localhost -p 5020
+
+  -t 0 = coils (type 0)
+
+--- Option 3: Python pymodbus (good for automation) ---
+
+Install:
+  pip install pymodbus
+
+Script (save as read_plc.py):
+
+  from pymodbus.client import ModbusTcpClient
+
+  client = ModbusTcpClient('localhost', port=5020)
+  client.connect()
+
+  # Read holding registers 0-9 (10 registers)
+  result = client.read_holding_registers(0, count=10, slave=1)
+  if not result.isError():
+      print("Holding Registers:", result.registers)
+  else:
+      print("Error:", result)
+
+  # Read input registers 0-9
+  result = client.read_input_registers(0, count=10, slave=1)
+  if not result.isError():
+      print("Input Registers:", result.registers)
+
+  # Read coils 0-7
+  result = client.read_coils(0, count=8, slave=1)
+  if not result.isError():
+      print("Coils:", result.bits[:8])
+
+  client.close()
+
+Run:
+  python read_plc.py
+
+--- Option 4: Rust tokio-modbus (your future production code) ---
+
+Add to Cargo.toml when ready:
+  tokio-modbus = "0.6"
+
+Basic read example:
+  use tokio_modbus::prelude::*;
+
+  let socket_addr = "127.0.0.1:502".parse().unwrap();
+  let mut ctx = tcp::connect(socket_addr).await?;
+
+  // Read 10 holding registers starting at address 0
+  let data = ctx.read_holding_registers(0, 10).await??;
+  println!("Registers: {:?}", data);
+
+Documentation: https://docs.rs/tokio-modbus/latest/tokio_modbus/
+
+=============================================================
+SECTION 6: STAGE 1 TESTING — RUST OUTSIDE DOCKER
+=============================================================
+
+This is how you test your code right now before the Dockerfile
+is written. OpenPLC runs in its own container. Your Rust
+binary runs on your host machine directly.
+
+Step 1: Pull and run the OpenPLC runtime container
+  docker run -d `
+    --name openplc-test `
+    -p 8443:8443 `
+    -p 502:502 `
+    -v openplc-data:/var/run/runtime `
+    ghcr.io/autonomy-logic/openplc-runtime:latest
+
+  The volume (-v) persists OpenPLC's database across restarts.
+  Without it, the user you create is forgotten on every restart.
+
+Step 2: Confirm it is running
+  docker logs openplc-test
+  You should see Flask starting up and the runtime initializing.
+
+Step 3: Get a program.zip
+  Download OpenPLC Editor:
+    https://github.com/Autonomy-Logic/openplc-editor/releases
+  Create a new project, compile it, export program.zip.
+  Even a blank project works for testing deploy sequence.
+
+Step 4: Run your Rust binary
+  $env:PLC_PASSWORD="yourpassword"
+  $env:PLC_USERNAME="admin"
+  $env:PROGRAM_ZIP="C:\path\to\your\program.zip"
+  $env:PLC_STARTUP_DELAY_SECS="0"
+  $env:NODE_ID="test-node"
+  $env:RUST_LOG="info"
+  cargo run
+
+  PLC_STARTUP_DELAY_SECS=0 because OpenPLC is already running.
+  You do not need to wait for it to start.
+
+Step 5: Watch the logs
+  You should see the full deploy sequence in your terminal.
+  If something fails, the error chain tells you exactly where.
+
+Step 6: Verify with Modbus
+  Use any tool from Section 5 to connect to localhost:502
+  and read registers. If the PLC is running you will get
+  responses (all zeros on a blank program).
+
+Step 7: Stop the test container when done
+  docker stop openplc-test
+  docker rm openplc-test
+
+=============================================================
+SECTION 7: STAGE 2 TESTING — FULL CONTAINER
+=============================================================
+
+After Stage 1 works, you build the full plc-node image.
+This tests that everything works together inside one container.
+
+Prerequisites:
+  - deploy.rs and main.rs are written and working (Stage 1)
+  - Dockerfile is written
+  - entrypoint.sh is written
+  - program.zip is in your project root
+
+Build the image:
+  docker build -t plc-node:latest .
+
+Run a container:
+  docker run -d `
+    --name plc-node-1 `
+    -p 8543:8443 `
+    -p 5020:502 `
+    -e PLC_PASSWORD=yourpassword `
+    -e NODE_ID=node-1 `
+    -e RUST_LOG=info `
+    --cap-add=SYS_NICE `
+    --cap-add=SYS_RESOURCE `
+    plc-node:latest
+
+Watch logs:
+  docker logs -f plc-node-1
+
+You should see:
+  OpenPLC startup messages (Flask, runtime initialization)
+  Then your Rust binary logs:
+    PLC node starting...
+    Waiting Xs for OpenPLC to start...
+    Starting deploy sequence
+    User created / already exists
+    Authenticated
+    Loaded zip (XXXX bytes)
+    Program uploaded
+    Compilation status: COMPILING (repeating)
+    Compilation succeeded
+    PLC is running
+    Deploy successful
+
+Read Modbus from host:
+  Connect to localhost:5020 (the mapped host port)
+  The container port 502 is what OpenPLC listens on internally.
+
+Stop and clean up:
+  docker stop plc-node-1
+  docker rm plc-node-1
+
+=============================================================
+SECTION 8: STAGE 3 — MULTIPLE CONTAINERS (FUTURE)
+=============================================================
+
+Once one container works, scaling to N is just docker-compose.
+
+docker-compose.yml structure:
+
+  version: '3.8'
+  services:
+    plc-node-1:
+      image: plc-node:latest
+      ports:
+        - "8543:8443"
+        - "5020:502"
+      environment:
+        - PLC_PASSWORD=yourpassword
+        - NODE_ID=node-1
+        - RUST_LOG=info
+      cap_add:
+        - SYS_NICE
+        - SYS_RESOURCE
+      volumes:
+        - plc-data-1:/var/run/runtime
+
+    plc-node-2:
+      image: plc-node:latest
+      ports:
+        - "8544:8443"
+        - "5021:502"
+      environment:
+        - PLC_PASSWORD=yourpassword
+        - NODE_ID=node-2
+        - RUST_LOG=info
+      cap_add:
+        - SYS_NICE
+        - SYS_RESOURCE
+      volumes:
+        - plc-data-2:/var/run/runtime
+
+  volumes:
+    plc-data-1:
+    plc-data-2:
+
+Start all containers:
+  docker-compose up -d
+
+Stop all containers:
+  docker-compose down
+
+Each container has its own isolated volume so OpenPLC
+databases do not interfere with each other.
+
+Your external Modbus master connects to each container
+by its unique host port:
+  node-1 → localhost:5020
+  node-2 → localhost:5021
+  node-3 → localhost:5022
+
+=============================================================
+SECTION 9: TROUBLESHOOTING
+=============================================================
+
+"Connection refused" on port 8443:
+  OpenPLC has not finished starting yet.
+  Increase PLC_STARTUP_DELAY_SECS.
+  Check docker logs openplc-test for errors.
+
+"Login rejected":
+  Password does not match what is in OpenPLC's database.
+  If using an existing volume, you must use the same
+  password that was used when the user was first created.
+  Delete the volume to start fresh:
+    docker volume rm openplc-data
+
+"Compilation failed":
+  The program.zip was rejected by CMake/GCC.
+  Check the error message — it includes the build logs.
+  Make sure you exported the zip from OpenPLC Editor,
+  not just zipped up arbitrary files.
+
+"No PLC program":
+  start_plc() was called before compilation finished.
+  wait_for_compilation() should prevent this — check
+  that it is actually completing successfully before
+  start_plc() is called.
+
+Modbus connection refused on port 502/5020:
+  The PLC is not running yet, or the Modbus plugin
+  is not enabled in OpenPLC's configuration.
+  Check that start_plc() succeeded in the logs.
+
+All Modbus registers read as zero:
+  This is normal for a blank PLC program.
+  Create a counter program (see Section 4) to verify
+  the simulation is actually executing.
